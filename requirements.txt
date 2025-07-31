@@ -11,6 +11,8 @@ unidic-lite  # MeCab dictionary
 
 # Community detection for network analysis
 python-louvain
+# Alternative: community (if python-louvain doesn't work)
+# community
 
 # OpenAI integration (optional)
 openai
