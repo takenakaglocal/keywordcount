@@ -48,9 +48,15 @@ if 'cooccurrence_data' not in st.session_state:
 if 'ai_keywords_cache' not in st.session_state:
     st.session_state.ai_keywords_cache = {}
 
-# ORG_CODE_MAPPINGの定義（省略）
+# ORG_CODE_MAPPINGの定義（一部のみ表示）
 ORG_CODE_MAPPING = {
-    # ... 省略 ...
+    # 例として一部のみ記載
+    "011002": "札幌市", "012025": "函館市", "012033": "小樽市",
+    "131016": "東京都千代田区", "131024": "東京都中央区", "131032": "東京都港区",
+    "141003": "横浜市", "141305": "川崎市", "141500": "相模原市",
+    "231002": "名古屋市", "271004": "大阪市", "281000": "神戸市",
+    "401005": "福岡市", "401307": "北九州市",
+    # 実際にはすべての自治体コードを含める必要があります
 }
 
 # 都道府県コードと名前のマッピング
@@ -301,6 +307,61 @@ JSONフォーマットは使用しないでください。
         st.error(f"AI抽出エラー: {e}")
         return []
 
+def tokenize_text(text, use_mecab=True, use_compound=True):
+    """単一テキストを単語に分解（エラーハンドリング強化版）"""
+    if pd.isna(text) or text == '':
+        return []
+    
+    text = str(text)
+    
+    if use_mecab and MECAB_AVAILABLE:
+        try:
+            tagger = MeCab.Tagger()
+            tagger.parse('')  # 初期化
+            
+            words = []
+            compounds = []
+            
+            node = tagger.parseToNode(text)
+            prev_node = None
+            
+            while node:
+                features = node.feature.split(',')
+                pos = features[0]
+                
+                if pos in ['名詞', '動詞', '形容詞']:
+                    word = features[6] if len(features) > 6 and features[6] != '*' else node.surface
+                    
+                    if word and word not in EXCLUDE_WORDS and len(word) > 1 and not word.isdigit():
+                        words.append(word)
+                        
+                        if use_compound and pos == '名詞' and prev_node:
+                            prev_features = prev_node.feature.split(',')
+                            if prev_features[0] == '名詞':
+                                prev_word = prev_features[6] if len(prev_features) > 6 and prev_features[6] != '*' else prev_node.surface
+                                if prev_word and prev_word not in EXCLUDE_WORDS and len(prev_word) > 1:
+                                    compound = prev_word + word
+                                    if len(compound) <= 10:
+                                        compounds.append(compound)
+                
+                prev_node = node if pos == '名詞' else None
+                node = node.next
+            
+            if use_compound:
+                words.extend(list(set(compounds)))
+            
+            return words
+        except Exception as e:
+            st.warning(f"MeCab処理エラー: {e}")
+            # フォールバック処理
+            return tokenize_text(text, use_mecab=False)
+    else:
+        # 簡易解析
+        pattern = r'[ァ-ヴー]+|[ぁ-ん]+|[一-龥]+|[a-zA-Z]+'
+        words = re.findall(pattern, text)
+        words = [w for w in words if w not in EXCLUDE_WORDS and len(w) > 1]
+        return words
+
 def tokenize_text_batch(texts, use_mecab=True, use_compound=True):
     """複数テキストを一括で単語に分解（バッチ処理用）"""
     results = []
@@ -329,14 +390,14 @@ def tokenize_text_batch(texts, use_mecab=True, use_compound=True):
                     if pos in ['名詞', '動詞', '形容詞']:
                         word = features[6] if len(features) > 6 and features[6] != '*' else node.surface
                         
-                        if word not in EXCLUDE_WORDS and len(word) > 1 and not word.isdigit():
+                        if word and word not in EXCLUDE_WORDS and len(word) > 1 and not word.isdigit():
                             words.append(word)
                             
                             if use_compound and pos == '名詞' and prev_node:
                                 prev_features = prev_node.feature.split(',')
                                 if prev_features[0] == '名詞':
                                     prev_word = prev_features[6] if len(prev_features) > 6 and prev_features[6] != '*' else prev_node.surface
-                                    if prev_word not in EXCLUDE_WORDS and len(prev_word) > 1:
+                                    if prev_word and prev_word not in EXCLUDE_WORDS and len(prev_word) > 1:
                                         compound = prev_word + word
                                         if len(compound) <= 10:
                                             compounds.append(compound)
@@ -368,9 +429,19 @@ def tokenize_text_batch(texts, use_mecab=True, use_compound=True):
     return results
 
 def calculate_cooccurrence(df, min_count=5, top_n_words=100, use_ai=False, api_key=None, sample_size=None):
-    """共起頻度を計算（高速化版）"""
+    """共起頻度を計算（エラーハンドリング強化版）"""
     import time
     start_time = time.time()
+    
+    # データの検証
+    if len(df) == 0:
+        st.error("データが空です")
+        return {}, {}, []
+    
+    # content_text列の存在確認
+    if 'content_text' not in df.columns:
+        st.error("content_text列が見つかりません")
+        return {}, {}, []
     
     # サンプリングの実施
     if sample_size and len(df) > sample_size:
@@ -386,7 +457,7 @@ def calculate_cooccurrence(df, min_count=5, top_n_words=100, use_ai=False, api_k
     total_docs = len(df)
     
     if use_ai and api_key:
-        # AI抽出（バッチ処理は難しいので個別処理）
+        # AI抽出
         processed_count = 0
         for idx, row in df.iterrows():
             processed_count += 1
@@ -394,7 +465,10 @@ def calculate_cooccurrence(df, min_count=5, top_n_words=100, use_ai=False, api_k
                 progress_bar.progress(processed_count / total_docs)
             
             text = row['content_text']
-            text_hash = hash(text[:100])
+            if pd.isna(text):
+                continue
+                
+            text_hash = hash(str(text)[:100])
             
             if text_hash in st.session_state.ai_keywords_cache:
                 words = st.session_state.ai_keywords_cache[text_hash]
@@ -409,7 +483,7 @@ def calculate_cooccurrence(df, min_count=5, top_n_words=100, use_ai=False, api_k
             for word1, word2 in itertools.combinations(sorted(unique_words), 2):
                 cooccurrence_counts[(word1, word2)] += 1
     else:
-        # 通常の形態素解析（バッチ処理で高速化）
+        # 通常の形態素解析
         batch_size = 100
         all_words_list = []
         
@@ -428,13 +502,16 @@ def calculate_cooccurrence(df, min_count=5, top_n_words=100, use_ai=False, api_k
         
         # 単語カウントと共起計算
         for words in all_words_list:
+            if not words:  # 空のリストをスキップ
+                continue
+                
             unique_words = list(set(words))
             
             # 単語の出現回数をカウント
             for word in unique_words:
                 word_counts[word] += 1
             
-            # 共起回数をカウント（NumPyで高速化）
+            # 共起回数をカウント
             if len(unique_words) > 1:
                 sorted_words = sorted(unique_words)
                 for i in range(len(sorted_words)):
@@ -447,32 +524,30 @@ def calculate_cooccurrence(df, min_count=5, top_n_words=100, use_ai=False, api_k
     elapsed_time = time.time() - start_time
     st.info(f"形態素解析完了: {elapsed_time:.1f}秒")
     
-    # 重要度スコアを計算（ベクトル化で高速化）
-    word_list = []
-    count_list = []
-    score_list = []
+    # データが空の場合の処理
+    if not word_counts:
+        st.warning("単語が抽出できませんでした")
+        return {}, {}, []
     
+    # 重要度スコアを計算
+    word_scores = []
     for word, count in word_counts.items():
         if count >= min_count:
-            word_list.append(word)
-            count_list.append(count)
-            score_list.append(calculate_word_importance_score(word, count, total_docs))
+            score = calculate_word_importance_score(word, count, total_docs)
+            word_scores.append((word, count, score))
     
-    # NumPy配列に変換してソート
-    import numpy as np
-    scores = np.array(score_list)
-    sorted_indices = np.argsort(scores)[::-1][:top_n_words]
+    # スコアでソート
+    word_scores.sort(key=lambda x: x[2], reverse=True)
     
     # 上位N語を選択
-    top_words = [word_list[i] for i in sorted_indices]
+    top_words = [item[0] for item in word_scores[:top_n_words]]
     top_words_set = set(top_words)
     
-    # 共起データをフィルタリング（高速化）
-    filtered_cooccurrence = {
-        key: count 
-        for key, count in cooccurrence_counts.items()
-        if key[0] in top_words_set and key[1] in top_words_set and count >= min_count
-    }
+    # 共起データをフィルタリング
+    filtered_cooccurrence = {}
+    for (word1, word2), count in cooccurrence_counts.items():
+        if word1 in top_words_set and word2 in top_words_set and count >= min_count:
+            filtered_cooccurrence[(word1, word2)] = count
     
     # 選択された単語のカウントのみを保持
     filtered_word_counts = {word: word_counts[word] for word in top_words}
@@ -481,101 +556,123 @@ def calculate_cooccurrence(df, min_count=5, top_n_words=100, use_ai=False, api_k
 
 def create_cooccurrence_network(word_counts, cooccurrence_data, top_words, layout_type='spring', 
                               community_resolution=1.0, edge_threshold=0.5):
-    """
-    共起ネットワークを作成
+    """共起ネットワークを作成（エラーハンドリング強化版）"""
+    # データの検証
+    if not word_counts or not top_words:
+        st.error("単語データが空です")
+        return [], {}, nx.Graph(), {}
     
-    Parameters:
-    - word_counts: 単語の出現回数
-    - cooccurrence_data: 共起データ
-    - top_words: 表示する単語リスト
-    - layout_type: レイアウトタイプ
-    - community_resolution: コミュニティ検出の解像度（高いほど小さなコミュニティ）
-    - edge_threshold: エッジ表示の閾値（0-1）
-    """
     # NetworkXグラフの作成
     G = nx.Graph()
     
     # ノードの追加
     for word in top_words:
-        G.add_node(word, count=word_counts[word])
+        if word in word_counts:
+            G.add_node(word, count=word_counts[word])
     
     # エッジの追加（重みの正規化）
     edge_weights = []
     for (word1, word2), count in cooccurrence_data.items():
-        # 正規化された重み（Jaccard係数的な計算）
-        weight = count / (word_counts[word1] + word_counts[word2] - count)
-        G.add_edge(word1, word2, weight=weight, raw_count=count)
-        edge_weights.append(weight)
+        if word1 in word_counts and word2 in word_counts:
+            # ゼロ除算を防ぐ
+            denominator = word_counts[word1] + word_counts[word2] - count
+            if denominator > 0:
+                weight = count / denominator
+            else:
+                weight = 0
+            G.add_edge(word1, word2, weight=weight, raw_count=count)
+            edge_weights.append(weight)
+    
+    # エッジがない場合の処理
+    if not edge_weights:
+        st.warning("共起関係が見つかりませんでした")
+        edge_weights = [0]  # デフォルト値
     
     # コミュニティ検出
+    partition = {}
     try:
-        import community as community_louvain
-        partition = community_louvain.best_partition(G, resolution=community_resolution)
-    except:
+        # python-louvainがインストールされている場合
+        import community.community_louvain as community_louvain
+        if len(G.nodes()) > 0 and len(G.edges()) > 0:
+            partition = community_louvain.best_partition(G, resolution=community_resolution)
+        else:
+            partition = {node: 0 for node in G.nodes()}
+    except ImportError:
         # community-louvainがインストールされていない場合
         partition = {node: 0 for node in G.nodes()}
         st.warning("コミュニティ検出ライブラリがインストールされていません。")
+    except Exception as e:
+        # その他のエラー
+        partition = {node: 0 for node in G.nodes()}
+        st.warning(f"コミュニティ検出でエラーが発生しました: {e}")
     
     # コミュニティごとにノードをグループ化
     communities = defaultdict(list)
     for node, comm_id in partition.items():
         communities[comm_id].append(node)
     
-    # レイアウトの計算（コミュニティを考慮）
-    if layout_type == 'spring':
-        # コミュニティごとの初期位置を設定
-        pos_init = {}
-        num_communities = len(communities)
-        
-        # コミュニティの中心を円周上に配置
-        community_centers = {}
-        for i, comm_id in enumerate(communities.keys()):
-            angle = 2 * np.pi * i / num_communities
-            center_x = 2 * np.cos(angle)
-            center_y = 2 * np.sin(angle)
-            community_centers[comm_id] = (center_x, center_y)
+    # グラフが空の場合の処理
+    if len(G.nodes()) == 0:
+        return [], {'num_nodes': 0, 'num_edges': 0, 'num_communities': 0, 'avg_degree': 0, 'density': 0}, G, partition
+    
+    # レイアウトの計算
+    try:
+        if layout_type == 'spring':
+            # 初期位置の設定
+            pos_init = {}
+            num_communities = max(len(communities), 1)
             
-            # コミュニティ内のノードを中心の周りに配置
-            nodes = communities[comm_id]
-            for j, node in enumerate(nodes):
-                if len(nodes) == 1:
-                    pos_init[node] = (center_x, center_y)
-                else:
-                    sub_angle = 2 * np.pi * j / len(nodes)
-                    radius = 0.5
-                    pos_init[node] = (
-                        center_x + radius * np.cos(sub_angle),
-                        center_y + radius * np.sin(sub_angle)
-                    )
-        
-        pos = nx.spring_layout(G, pos=pos_init, k=2, iterations=50, weight='weight')
-    elif layout_type == 'circular':
-        pos = nx.circular_layout(G)
-    elif layout_type == 'kamada_kawai':
-        pos = nx.kamada_kawai_layout(G)
-    else:
+            for i, comm_id in enumerate(communities.keys()):
+                angle = 2 * np.pi * i / num_communities
+                center_x = 2 * np.cos(angle)
+                center_y = 2 * np.sin(angle)
+                
+                nodes = communities[comm_id]
+                for j, node in enumerate(nodes):
+                    if len(nodes) == 1:
+                        pos_init[node] = (center_x, center_y)
+                    else:
+                        sub_angle = 2 * np.pi * j / len(nodes)
+                        radius = 0.5
+                        pos_init[node] = (
+                            center_x + radius * np.cos(sub_angle),
+                            center_y + radius * np.sin(sub_angle)
+                        )
+            
+            pos = nx.spring_layout(G, pos=pos_init, k=2, iterations=50, weight='weight')
+        elif layout_type == 'circular':
+            pos = nx.circular_layout(G)
+        elif layout_type == 'kamada_kawai':
+            pos = nx.kamada_kawai_layout(G)
+        else:
+            pos = nx.random_layout(G, seed=42)
+    except Exception as e:
+        st.warning(f"レイアウト計算でエラーが発生しました: {e}")
         pos = nx.random_layout(G, seed=42)
     
-    # コミュニティカラーの設定
+    # カラーパレットの設定
     colors = px.colors.qualitative.Plotly + px.colors.qualitative.Set3
     community_colors = {}
     for i, comm_id in enumerate(sorted(communities.keys())):
         community_colors[comm_id] = colors[i % len(colors)]
     
-    # エッジデータの準備（コミュニティ内外で区別）
-    intra_edges = []  # コミュニティ内エッジ
-    inter_edges = []  # コミュニティ間エッジ
+    # エッジデータの準備
+    intra_edges = []
+    inter_edges = []
+    
+    max_weight = max(edge_weights) if edge_weights else 1
+    threshold = edge_threshold * max_weight
     
     for edge in G.edges(data=True):
-        if edge[2]['weight'] >= edge_threshold * max(edge_weights):
+        if 'weight' in edge[2] and edge[2]['weight'] >= threshold:
             edge_data = {
                 'x': [pos[edge[0]][0], pos[edge[1]][0], None],
                 'y': [pos[edge[0]][1], pos[edge[1]][1], None],
                 'weight': edge[2]['weight'],
-                'count': edge[2]['raw_count']
+                'count': edge[2].get('raw_count', 0)
             }
             
-            if partition[edge[0]] == partition[edge[1]]:
+            if partition.get(edge[0], 0) == partition.get(edge[1], 0):
                 intra_edges.append(edge_data)
             else:
                 inter_edges.append(edge_data)
@@ -583,7 +680,7 @@ def create_cooccurrence_network(word_counts, cooccurrence_data, top_words, layou
     # Plotlyのトレースを作成
     traces = []
     
-    # コミュニティ間エッジ（薄い線）
+    # エッジの描画
     for edge in inter_edges:
         traces.append(go.Scatter(
             x=edge['x'], y=edge['y'],
@@ -594,7 +691,6 @@ def create_cooccurrence_network(word_counts, cooccurrence_data, top_words, layou
             showlegend=False
         ))
     
-    # コミュニティ内エッジ（濃い線）
     for edge in intra_edges:
         traces.append(go.Scatter(
             x=edge['x'], y=edge['y'],
@@ -605,31 +701,43 @@ def create_cooccurrence_network(word_counts, cooccurrence_data, top_words, layou
             showlegend=False
         ))
     
-    # コミュニティごとにノードを描画
+    # ノードの描画
     for comm_id, nodes in communities.items():
-        node_x = [pos[node][0] for node in nodes]
-        node_y = [pos[node][1] for node in nodes]
-        node_text = nodes
-        node_size = [np.log(G.nodes[node]['count'] + 1) * 10 for node in nodes]
-        hover_text = [f"{node}<br>出現回数: {G.nodes[node]['count']}<br>コミュニティ: {comm_id}" 
-                     for node in nodes]
+        if not nodes:
+            continue
+            
+        node_x = []
+        node_y = []
+        node_text = []
+        node_size = []
+        hover_text = []
         
-        traces.append(go.Scatter(
-            x=node_x, y=node_y,
-            mode='markers+text',
-            name=f'コミュニティ {comm_id}',
-            marker=dict(
-                size=node_size,
-                color=community_colors[comm_id],
-                line=dict(width=2, color='white')
-            ),
-            text=node_text,
-            textposition="top center",
-            hovertext=hover_text,
-            hoverinfo='text'
-        ))
+        for node in nodes:
+            if node in pos:
+                node_x.append(pos[node][0])
+                node_y.append(pos[node][1])
+                node_text.append(node)
+                count = G.nodes[node].get('count', 1)
+                node_size.append(np.log(count + 1) * 10)
+                hover_text.append(f"{node}<br>出現回数: {count}<br>コミュニティ: {comm_id}")
+        
+        if node_x:  # ノードが存在する場合のみ描画
+            traces.append(go.Scatter(
+                x=node_x, y=node_y,
+                mode='markers+text',
+                name=f'コミュニティ {comm_id}',
+                marker=dict(
+                    size=node_size,
+                    color=community_colors.get(comm_id, 'gray'),
+                    line=dict(width=2, color='white')
+                ),
+                text=node_text,
+                textposition="top center",
+                hovertext=hover_text,
+                hoverinfo='text'
+            ))
     
-    # 全体の統計情報
+    # 統計情報
     stats = {
         'num_nodes': len(G.nodes()),
         'num_edges': len(G.edges()),
@@ -1515,3 +1623,113 @@ if st.session_state.df_loaded and st.session_state.df_with_locations is not None
                                 'top_words': top_words,
                                 'graph': G
                             }
+    
+    with tab5:
+        st.header("データ詳細")
+        
+        # フィルタリング
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            detail_pref = st.selectbox(
+                "都道府県でフィルタ",
+                options=['すべて'] + sorted(df['prefecture_name'].dropna().unique().tolist()),
+                key="detail_pref"
+            )
+        with col2:
+            detail_muni = st.selectbox(
+                "市区町村でフィルタ",
+                options=['すべて'] + (
+                    sorted(df[df['prefecture_name'] == detail_pref]['municipality_name'].dropna().unique().tolist())
+                    if detail_pref != 'すべて' else sorted(df['municipality_name'].dropna().unique().tolist())
+                ),
+                key="detail_muni"
+            )
+        with col3:
+            detail_year = st.selectbox(
+                "年度でフィルタ",
+                options=['すべて'] + sorted(df['fiscal_year'].dropna().unique().tolist()),
+                key="detail_year"
+            )
+        
+        # データをフィルタリング
+        df_detail = df.copy()
+        if detail_pref != 'すべて':
+            df_detail = df_detail[df_detail['prefecture_name'] == detail_pref]
+        if detail_muni != 'すべて':
+            df_detail = df_detail[df_detail['municipality_name'] == detail_muni]
+        if detail_year != 'すべて':
+            df_detail = df_detail[df_detail['fiscal_year'] == detail_year]
+        
+        # データ件数を表示
+        st.info(f"フィルタ後のデータ件数: {len(df_detail):,}件")
+        
+        # 表示する列を選択
+        all_columns = df_detail.columns.tolist()
+        default_columns = ['prefecture_name', 'municipality_name', 'fiscal_year', 'title', 'content_text']
+        display_columns = [col for col in default_columns if col in all_columns]
+        
+        selected_columns = st.multiselect(
+            "表示する列を選択",
+            options=all_columns,
+            default=display_columns
+        )
+        
+        if selected_columns:
+            # データ表示
+            st.dataframe(
+                df_detail[selected_columns],
+                use_container_width=True,
+                height=600
+            )
+            
+            # CSVダウンロード
+            csv = df_detail[selected_columns].to_csv(index=False, encoding='utf-8-sig')
+            st.download_button(
+                label="フィルタ済みデータをCSVでダウンロード",
+                data=csv,
+                file_name=f"filtered_data_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                mime="text/csv"
+            )
+        else:
+            st.warning("表示する列を選択してください。")
+
+else:
+    st.info("👆 サイドバーからCSVファイルをアップロードしてください。")
+    
+    # サンプルデータの説明
+    with st.expander("必要なCSVファイルの形式"):
+        st.markdown("""
+        以下の列を含むCSVファイルが必要です：
+        
+        - **code**: 自治体コード（6桁）
+        - **fiscal_year_start**: 年度開始日または年度
+        - **file_id**: ファイルID（文書を識別）
+        - **title**: タイトル（オプション）
+        - **content_text**: 分析対象のテキスト内容
+        
+        その他の列があっても問題ありません。
+        """)
+        
+        # サンプルデータ
+        sample_data = pd.DataFrame({
+            'code': ['131016', '141003', '271004'],
+            'fiscal_year_start': ['2023-04-01', '2023-04-01', '2023-04-01'],
+            'file_id': ['doc001', 'doc002', 'doc003'],
+            'title': ['デジタル化推進計画', '食育推進計画', '防災計画'],
+            'content_text': [
+                'デジタル化により市民サービスの向上を図る。AIやIoTを活用した新しい行政サービスを展開。',
+                '学校給食における食育の推進。地産地消を通じた食育教育の実施。',
+                '防災・減災対策の強化。避難所の整備と防災訓練の実施。'
+            ]
+        })
+        
+        st.dataframe(sample_data)
+        
+        # サンプルCSVダウンロード
+        sample_csv = sample_data.to_csv(index=False, encoding='utf-8-sig')
+        st.download_button(
+            label="サンプルCSVをダウンロード",
+            data=sample_csv,
+            file_name="sample_data.csv",
+            mime="text/csv"
+        )
