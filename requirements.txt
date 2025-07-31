@@ -1,5 +1,20 @@
+# Core libraries
 streamlit
 pandas
 numpy
 plotly
 networkx
+
+# Japanese text processing
+mecab-python3
+unidic-lite  # MeCab dictionary
+
+# Community detection for network analysis
+python-louvain
+
+# OpenAI integration (optional)
+openai
+
+# Additional utilities
+scipy  # For advanced network layouts
+scikit-learn  # For potential future ML features
